@@ -1,0 +1,454 @@
+name: build-cleanplus
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Write source
+        run: |
+          cat > CleanPlus.m <<'CPEOF'
+          //
+          //  CleanPlus — 汽水音乐 / 哔哩哔哩 去广告
+          //
+          //  给非越狱设备的注入版：不依赖 MobileSubstrate / Logos，
+          //  只用 Objective-C runtime 交换方法实现，编译出来是一个自包含的 dylib。
+          //  注入进已砸壳的 IPA、重签后即可生效。
+          //
+          //  三条腿：
+          //   1. NSURLProtocol 拦广告与统计域名
+          //   2. B 站开屏标记（BFCSplashLaunchInfo）
+          //   3. 广告视图隐藏 + 广告页禁止弹出
+          //
+
+          #import <Foundation/Foundation.h>
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+
+          static NSString *const kCPPrefsPath = @"/var/mobile/Library/Preferences/com.cleanplus.plist";
+          static NSString *const kCPLogPath   = @"/var/mobile/Library/Logs/CleanPlus.log";
+
+          #pragma mark - 路径（兼容无根越狱）
+
+          static NSString *CPRoot(void) {
+              static NSString *root = @"";
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"]) root = @"/var/jb";
+              });
+              return root;
+          }
+
+          static NSString *CPPath(NSString *path) {
+              return [CPRoot() stringByAppendingString:path];
+          }
+
+          #pragma mark - 默认规则
+
+          // 只做“域名后缀”匹配：写 example.com 同时命中 a.example.com。
+          // 想临时放过某个域名，把它写进配置的 allowHosts。
+          static NSArray<NSString *> *CPDefaultHosts(void) {
+              return @[
+                  // 汽水音乐 / 字节系
+                  @"pangolin-sdk-toutiao.com",   // 穿山甲广告 SDK（开屏、激励视频）
+                  @"ad.oceanengine.com",         // 巨量引擎投放
+                  @"log.snssdk.com",             // 日志上报
+                  @"applog.snssdk.com",          // 日志上报
+                  @"mon.zijieapi.com",           // 崩溃 / 性能上报
+
+                  // 哔哩哔哩
+                  @"cm.bilibili.com",            // 广告投放
+                  @"ad.bilibili.com",            // 广告位
+                  @"data.bilibili.com",          // 数据统计
+                  @"adash.bilibili.com",         // 统计 SDK
+
+                  // 常见第三方广告联盟（可删）
+                  @"gdt.qq.com",                 // 优量汇
+                  @"mi.gdt.qq.com",
+                  @"pgdt.gtimg.cn",
+                  @"ms.applovin.com",            // AppLovin
+              ];
+          }
+
+          static NSArray<NSString *> *CPStringArray(id value) {
+              if ([value isKindOfClass:[NSArray class]]) {
+                  NSMutableArray *out = [NSMutableArray array];
+                  for (id item in (NSArray *)value) {
+                      if ([item isKindOfClass:[NSString class]] && [item length]) [out addObject:item];
+                  }
+                  return out;
+              }
+              return @[];
+          }
+
+          #pragma mark - 配置
+
+          // 注入到未越狱 App 时写不了 /var/mobile/Library/Preferences，
+          // 所以优先读 .app 根目录下的 CleanPlus.plist（注入时一起放进去即可）。
+          static NSString *CPConfigFile(void) {
+              NSMutableArray *candidates = [NSMutableArray array];
+              NSString *bundlePath = [NSBundle mainBundle].bundlePath;
+              if (bundlePath.length) {
+                  [candidates addObject:[bundlePath stringByAppendingPathComponent:@"CleanPlus.plist"]];
+              }
+              [candidates addObject:CPPath(kCPPrefsPath)];
+              NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              if (documents.length) {
+                  [candidates addObject:[documents stringByAppendingPathComponent:@"CleanPlus.plist"]];
+              }
+              for (NSString *candidate in candidates) {
+                  if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) return candidate;
+              }
+              return nil;
+          }
+
+          static NSDictionary *CPConfig(void) {
+              static NSDictionary *config;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  NSMutableDictionary *values = [@{
+                      @"enabled": @YES,          // 总开关
+                      @"hideAdViews": @YES,      // 视图层兜底
+                      @"blockAdPresent": @YES,   // 广告控制器禁止弹出
+                      @"logBlocked": @NO,        // 记录日志（排查时打开）
+                      @"extraHosts": @[],        // 追加域名
+                      @"allowHosts": @[],        // 强制放行域名
+                      @"blockURLPatterns": @[],  // 完整 URL 子串，慎用
+                  } mutableCopy];
+
+                  NSString *configFile = CPConfigFile();
+                  NSDictionary *user = configFile ? [NSDictionary dictionaryWithContentsOfFile:configFile] : nil;
+                  if ([user isKindOfClass:[NSDictionary class]]) {
+                      [values addEntriesFromDictionary:user];
+                  }
+
+                  NSMutableArray *hosts = [CPDefaultHosts() mutableCopy];
+                  [hosts addObjectsFromArray:CPStringArray(values[@"extraHosts"])];
+                  values[@"hosts"] = hosts;
+
+                  config = [values copy];
+              });
+              return config;
+          }
+
+          static BOOL CPEnabled(void) {
+              return [CPConfig()[@"enabled"] boolValue];
+          }
+
+          static NSArray<NSString *> *CPHosts(void) {
+              return CPStringArray(CPConfig()[@"hosts"]);
+          }
+
+          #pragma mark - 匹配
+
+          static BOOL CPHostMatches(NSString *host, NSString *rule) {
+              if (!host.length || !rule.length) return NO;
+              NSString *h = host.lowercaseString;
+              NSString *r = rule.lowercaseString;
+              if ([h isEqualToString:r]) return YES;
+              return [h hasSuffix:[@"." stringByAppendingString:r]];
+          }
+
+          static BOOL CPShouldBlockURL(NSURL *url) {
+              if (!CPEnabled() || !url) return NO;
+
+              NSString *host = url.host.lowercaseString;
+              NSString *absolute = url.absoluteString;
+              NSDictionary *config = CPConfig();
+
+              for (NSString *allowed in CPStringArray(config[@"allowHosts"])) {
+                  if (CPHostMatches(host, allowed)) return NO;
+              }
+
+              for (NSString *pattern in CPStringArray(config[@"blockURLPatterns"])) {
+                  if ([absolute rangeOfString:pattern].location != NSNotFound) return YES;
+              }
+
+              if (!host.length) return NO;
+              for (NSString *rule in CPHosts()) {
+                  if (CPHostMatches(host, rule)) return YES;
+              }
+              return NO;
+          }
+
+          #pragma mark - 日志
+
+          static dispatch_queue_t CPLogQueue(void) {
+              static dispatch_queue_t queue;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  queue = dispatch_queue_create("com.cleanplus.log", DISPATCH_QUEUE_SERIAL);
+              });
+              return queue;
+          }
+
+          // 沙箱里不一定写得了 /var/mobile/Library/Logs，写不了就退回 App 自己的 tmp。
+          static NSString *CPLogFilePath(void) {
+              static NSString *path;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  NSString *preferred = CPPath(kCPLogPath);
+                  NSString *directory = [preferred stringByDeletingLastPathComponent];
+                  [fm createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:NULL];
+                  if ([fm isWritableFileAtPath:directory]) {
+                      path = preferred;
+                  } else {
+                      path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"CleanPlus.log"];
+                  }
+              });
+              return path;
+          }
+
+          static void CPLogLine(NSString *message) {
+              if (![CPConfig()[@"logBlocked"] boolValue]) return;
+              NSLog(@"[CleanPlus] %@", message);
+
+              dispatch_async(CPLogQueue(), ^{
+                  static NSDateFormatter *formatter;
+                  static dispatch_once_t once;
+                  dispatch_once(&once, ^{
+                      formatter = [NSDateFormatter new];
+                      formatter.dateFormat = @"MM-dd HH:mm:ss";
+                  });
+
+                  NSString *path = CPLogFilePath();
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+
+                  NSDictionary *attributes = [fm attributesOfItemAtPath:path error:NULL];
+                  if ([attributes fileSize] > 512 * 1024) [fm removeItemAtPath:path error:NULL];
+
+                  NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+                  if (!handle) return;
+                  @try {
+                      [handle seekToEndOfFile];
+                      NSString *line = [NSString stringWithFormat:@"%@ %@\n", [formatter stringFromDate:[NSDate date]], message];
+                      [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                  } @catch (__unused NSException *exception) {
+                  }
+                  [handle closeFile];
+              });
+          }
+
+          #pragma mark - 网络层
+
+          @interface CPURLProtocol : NSURLProtocol
+          @end
+
+          @implementation CPURLProtocol
+
+          + (BOOL)canInitWithRequest:(NSURLRequest *)request {
+              NSURL *url = request.URL;
+              if (!url) return NO;
+              if ([NSURLProtocol propertyForKey:@"CPHandled" inRequest:request]) return NO;
+
+              NSString *scheme = url.scheme.lowercaseString;
+              if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+
+              return CPShouldBlockURL(url);
+          }
+
+          + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+              return request;
+          }
+
+          - (void)startLoading {
+              NSURLRequest *request = self.request;
+              CPLogLine([NSString stringWithFormat:@"BLOCK %@", request.URL.absoluteString]);
+
+              NSData *body = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+              NSHTTPURLResponse *response =
+                  [[NSHTTPURLResponse alloc] initWithURL:request.URL
+                                             statusCode:200
+                                            HTTPVersion:@"HTTP/1.1"
+                                           headerFields:@{
+                                               @"Content-Type": @"application/json",
+                                               @"Content-Length": [@(body.length) stringValue],
+                                           }];
+
+              [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+              [self.client URLProtocol:self didLoadData:body];
+              [self.client URLProtocolDidFinishLoading:self];
+          }
+
+          - (void)stopLoading {
+              // 响应是同步给完的，没有要取消的东西。
+          }
+
+          @end
+
+          #pragma mark - 视图层
+
+          static BOOL CPNameLooksLikeAd(NSString *name) {
+              if (!name.length) return NO;
+
+              static NSArray<NSString *> *needles;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  needles = @[
+                      @"splashad", @"adsplash", @"advert", @"interstitial",
+                      @"rewardad", @"rewardvideo", @"bannerad", @"nativead",
+                      @"expressad", @"busplash", @"bunative", @"adcontainer",
+                  ];
+              });
+
+              NSString *lower = name.lowercaseString;
+              for (NSString *needle in needles) {
+                  if ([lower containsString:needle]) return YES;
+              }
+              return NO;
+          }
+
+          static void CPSweepView(UIView *view, NSInteger depth) {
+              if (!view || depth > 24) return;
+
+              if (CPNameLooksLikeAd(NSStringFromClass(view.class))) {
+                  if (!view.hidden) {
+                      view.hidden = YES;
+                      CPLogLine([NSString stringWithFormat:@"HIDE view %@", NSStringFromClass(view.class)]);
+                  }
+                  return;
+              }
+
+              for (UIView *subview in [view.subviews copy]) {
+                  CPSweepView(subview, depth + 1);
+              }
+          }
+
+          static void CPSweepAll(BOOL force) {
+              if (!CPEnabled() || ![CPConfig()[@"hideAdViews"] boolValue]) return;
+
+              static CFAbsoluteTime lastSweep = 0;
+              CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+              if (!force && now - lastSweep < 0.4) return;
+              lastSweep = now;
+
+              for (UIWindow *window in [UIApplication sharedApplication].windows) {
+                  CPSweepView(window, 0);
+              }
+          }
+
+          // 启动后的一小段时间里反复扫，开屏和插屏大多在这时出现。
+          static void CPScheduleSweeps(void) {
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  for (NSNumber *delay in @[@0.6, @1.8, @3.5, @7.0, @12.0]) {
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                                     dispatch_get_main_queue(), ^{
+                          CPSweepAll(YES);
+                      });
+                  }
+              });
+          }
+
+          #pragma mark - 方法替换
+
+          static IMP CPReplaceInstance(Class cls, SEL selector, IMP replacement) {
+              if (!cls) return NULL;
+              Method method = class_getInstanceMethod(cls, selector);
+              if (!method) return NULL;
+              return method_setImplementation(method, replacement);
+          }
+
+          static IMP CPReplaceClass(Class cls, SEL selector, IMP replacement) {
+              if (!cls) return NULL;
+              Method method = class_getClassMethod(cls, selector);
+              if (!method) return NULL;
+              return method_setImplementation(method, replacement);
+          }
+
+          #pragma mark - 开屏
+
+          static IMP CPOrigSplashInfo = NULL;
+
+          static id CPHookSplashInfo(id self, SEL _cmd, BOOL with, BOOL awake, BOOL hot) {
+              // 把 launchFlag 顶成 YES，B 站就不再请求启动广告。
+              return ((id (*)(id, SEL, BOOL, BOOL, BOOL))CPOrigSplashInfo)(self, _cmd, YES, awake, hot);
+          }
+
+          #pragma mark - 广告页 / 广告视图
+
+          static IMP CPOrigPresent = NULL;
+          static IMP CPOrigViewDidAppear = NULL;
+          static IMP CPOrigMakeKey = NULL;
+
+          static void CPHookPresent(id self, SEL _cmd, UIViewController *controller, BOOL animated, void (^completion)(void)) {
+              if (!CPOrigPresent) return;
+              if (CPEnabled() && [CPConfig()[@"blockAdPresent"] boolValue]
+                  && controller && CPNameLooksLikeAd(NSStringFromClass(controller.class))) {
+                  CPLogLine([NSString stringWithFormat:@"BLOCK present %@", NSStringFromClass(controller.class)]);
+                  return;
+              }
+              ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))CPOrigPresent)(self, _cmd, controller, animated, completion);
+          }
+
+          static void CPHookViewDidAppear(id self, SEL _cmd, BOOL animated) {
+              if (!CPOrigViewDidAppear) return;
+              ((void (*)(id, SEL, BOOL))CPOrigViewDidAppear)(self, _cmd, animated);
+              if (!CPEnabled()) return;
+
+              if ([CPConfig()[@"hideAdViews"] boolValue]) {
+                  CPSweepAll(NO);
+              }
+          }
+
+          static void CPHookMakeKeyAndVisible(id self, SEL _cmd) {
+              if (!CPOrigMakeKey) return;
+              ((void (*)(id, SEL))CPOrigMakeKey)(self, _cmd);
+              CPScheduleSweeps();
+          }
+
+          #pragma mark - 安装
+
+          static void CPInstallHooks(void) {
+              CPOrigMakeKey = CPReplaceInstance([UIWindow class], @selector(makeKeyAndVisible), (IMP)CPHookMakeKey);
+              CPOrigViewDidAppear = CPReplaceInstance([UIViewController class], @selector(viewDidAppear:), (IMP)CPHookViewDidAppear);
+              CPOrigPresent = CPReplaceInstance([UIViewController class],
+                                                @selector(presentViewController:animated:completion:),
+                                                (IMP)CPHookPresent);
+
+              Class splash = objc_getClass("BFCSplashLaunchInfo");
+              if (splash) {
+                  CPOrigSplashInfo = CPReplaceClass(splash, @selector(infoWith:linkAwake:inHot:), (IMP)CPHookSplashInfo);
+                  if (CPOrigSplashInfo) NSLog(@"[CleanPlus] splash hook installed");
+              }
+          }
+
+          __attribute__((constructor)) static void CPCtor(void) {
+              @autoreleasepool {
+                  if (!CPEnabled()) return;
+
+                  [NSURLProtocol registerClass:[CPURLProtocol class]];
+                  CPInstallHooks();
+
+                  NSLog(@"[CleanPlus] loaded, %lu hosts", (unsigned long)CPHosts().count);
+                  CPLogLine([NSString stringWithFormat:@"loaded, %lu hosts", (unsigned long)CPHosts().count]);
+                  CPScheduleSweeps();
+              }
+          }
+          CPEOF
+
+      - name: Compile dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p build
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc -O2 -dynamiclib \
+            -install_name @executable_path/CleanPlus.dylib \
+            -framework Foundation -framework UIKit \
+            -o build/CleanPlus.dylib CleanPlus.m
+          lipo -info build/CleanPlus.dylib
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: CleanPlus-dylib
+          path: build/CleanPlus.dylib
+          if-no-files-found: error
