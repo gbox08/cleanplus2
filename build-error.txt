@@ -1,0 +1,10 @@
+CleanPlus.m:317:64: warning: 'windows' is deprecated: first deprecated in iOS 15.0 - Use UIWindowScene.windows on a relevant window scene instead [-Wdeprecated-declarations]
+  317 |     for (UIWindow *window in [UIApplication sharedApplication].windows) {
+      |                                                                ^
+/Applications/Xcode_16.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h:109:62: note: 'windows' has been explicitly marked deprecated here
+  109 | @property(nonatomic,readonly) NSArray<__kindof UIWindow *>  *windows API_DEPRECATED("Use UIWindowScene.windows on a relevant window scene instead", ios(2.0, 15.0), visionos(1.0, 1.0)) API_UNAVAILABLE(watchos);
+      |                                                              ^
+CleanPlus.m:395:92: error: use of undeclared identifier 'CPHookMakeKey'
+  395 |     CPOrigMakeKey = CPReplaceInstance([UIWindow class], @selector(makeKeyAndVisible), (IMP)CPHookMakeKey);
+      |                                                                                            ^
+1 warning and 1 error generated.
