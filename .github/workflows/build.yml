@@ -116,6 +116,7 @@ jobs:
               dispatch_once(&once, ^{
                   NSMutableDictionary *values = [@{
                       @"enabled": @YES,          // 总开关
+                      @"installUIHooks": @NO,    // 视图层 hook：默认关，先确认能不能过检测
                       @"hideAdViews": @YES,      // 视图层兜底
                       @"blockAdPresent": @YES,   // 广告控制器禁止弹出
                       @"logBlocked": @NO,        // 记录日志（排查时打开）
@@ -427,8 +428,15 @@ jobs:
               @autoreleasepool {
                   if (!CPEnabled()) return;
 
+                  // 有些安全 SDK 会读这个环境变量，清了再说。
+                  unsetenv("DYLD_INSERT_LIBRARIES");
+                  unsetenv("DYLD_FRAMEWORK_PATH");
+                  unsetenv("DYLD_LIBRARY_PATH");
+
                   [NSURLProtocol registerClass:[CPURLProtocol class]];
-                  CPInstallHooks();
+                  if ([CPConfig()[@"installUIHooks"] boolValue]) {
+                      CPInstallHooks();
+                  }
 
                   NSLog(@"[CleanPlus] loaded, %lu hosts", (unsigned long)CPHosts().count);
                   CPLogLine([NSString stringWithFormat:@"loaded, %lu hosts", (unsigned long)CPHosts().count]);
@@ -441,7 +449,6 @@ jobs:
         run: |
           set -o pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK=$SDK"
           mkdir -p build
           xcrun --sdk iphoneos clang \
             -arch arm64 -arch arm64e \
