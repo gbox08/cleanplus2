@@ -410,7 +410,7 @@ jobs:
           #pragma mark - 安装
 
           static void CPInstallHooks(void) {
-              CPOrigMakeKey = CPReplaceInstance([UIWindow class], @selector(makeKeyAndVisible), (IMP)CPHookMakeKey);
+              CPOrigMakeKey = CPReplaceInstance([UIWindow class], @selector(makeKeyAndVisible), (IMP)CPHookMakeKeyAndVisible);
               CPOrigViewDidAppear = CPReplaceInstance([UIViewController class], @selector(viewDidAppear:), (IMP)CPHookViewDidAppear);
               CPOrigPresent = CPReplaceInstance([UIViewController class],
                                                 @selector(presentViewController:animated:completion:),
@@ -440,7 +440,6 @@ jobs:
       - name: Compile dylib
         run: |
           set -o pipefail
-          xcodebuild -version
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK=$SDK"
           mkdir -p build
@@ -448,7 +447,7 @@ jobs:
             -arch arm64 -arch arm64e \
             -isysroot "$SDK" \
             -miphoneos-version-min=15.0 \
-            -fobjc-arc -O2 -dynamiclib \
+            -fobjc-arc -O2 -Wno-deprecated-declarations -dynamiclib \
             -install_name @executable_path/CleanPlus.dylib \
             -framework Foundation -framework UIKit \
             -o build/CleanPlus.dylib CleanPlus.m 2>&1 | tee build.log
@@ -462,6 +461,17 @@ jobs:
           git config user.email "cleanplus-ci@users.noreply.github.com"
           git add build-error.txt || true
           git commit -m "ci: build log [skip ci]" || true
+          git push
+
+      - name: Publish dylib
+        if: success()
+        run: |
+          mkdir -p dist
+          cp build/CleanPlus.dylib dist/CleanPlus.dylib
+          git config user.name "cleanplus-ci"
+          git config user.email "cleanplus-ci@users.noreply.github.com"
+          git add dist/CleanPlus.dylib
+          git commit -m "build: CleanPlus.dylib [skip ci]" || true
           git push
 
       - name: Upload artifact
